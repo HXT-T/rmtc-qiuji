@@ -3,6 +3,7 @@ import heapq
 import math
 from collections import Counter
 from dataclasses import dataclass
+from .known_map import solve
 from .protocol import DIRECTIONS, OPPOSITE
 
 
@@ -12,6 +13,11 @@ def add(a, b):
 
 def manhattan(a, b):
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def kind(value):
+    """Mission category of a resource by its value."""
+    return "high_resources" if value >= 20 else "normal_resources"
 
 
 class WorldMemory:
@@ -29,6 +35,8 @@ class WorldMemory:
         self.last_score = 0.0
         self.last_tick = -1
         self.distance_cache = (None, {})  # terrain key -> per-source Dijkstra maps
+        self.spawn = None  # own first position: rival spawns are hypothesised from it
+        self.ever_seen = {}  # every resource position observed this match -> value
 
     def update(self, frame, events=None):
         if events:
@@ -51,7 +59,7 @@ class WorldMemory:
         previous = self.resources.get(frame.position)
         if previous and self.last_tick == frame.tick - 1 and current_value > self.last_score:
             if abs(current_value - self.last_score - previous["value"]) < 1e-6:
-                self.collected["high_resources" if previous["value"] >= 20 else "normal_resources"] += 1
+                self.collected[kind(previous["value"])] += 1
         self.last_score, self.last_tick = current_value, frame.tick
         px, py = frame.position
         visible = {(x, y) for y in range(max(0, py - frame.radius), min(frame.height, py + frame.radius + 1))
@@ -80,7 +88,10 @@ class WorldMemory:
                 self.obstacle_last_seen[entity["pos"]] = frame.tick
             elif entity["type"].startswith("resource_"):
                 self.resources[entity["pos"]] = dict(entity, last_seen=frame.tick)
+                self.ever_seen[entity["pos"]] = entity["value"]
         self.visits[frame.position] += 1
+        if self.spawn is None:
+            self.spawn = frame.position
         self.fail_until = {p: until for p, until in self.fail_until.items() if until > frame.tick}
 
 
@@ -98,6 +109,7 @@ class Planner:
         self.config = config
         self.memory = WorldMemory()
         self.patrol_goal = None
+        self.exact = (None, [])  # stage 1: (remaining resources, their optimal order)
 
     def resource_gain(self, frame, value, planned_value=0):
         if self.config.stage == 1:
@@ -167,14 +179,13 @@ class Planner:
 
     def _mission_bonus(self, frame, value, counts):
         done = set(frame.score.get("mission_completed_ids", []))
-        bonus = 0.0
-        kind = "high_resources" if value >= 20 else "normal_resources"
+        bonus, category = 0.0, kind(value)
         for mission in frame.missions:
             if mission["id"] in done:
                 continue
-            if mission["type"] == kind:
-                left = max(1, mission["target"] - self.memory.collected[kind])
-                if counts[kind] <= left:
+            if mission["type"] == category:
+                left = max(1, mission["target"] - self.memory.collected[category])
+                if counts[category] <= left:
                     bonus += 5.0 / left
             elif mission["type"] == "resource_value":
                 left = max(0, mission["target"] - frame.score.get("resource_value", 0))
@@ -212,10 +223,12 @@ class Planner:
                         if slack <= 2:
                             return self._route_to(target, parent, frame, events, history, "evacuate", 5.0)
         goals = []
+        rivals = self._rival_reach(frame, events) if c.stage == 2 else []
         for p, resource in memory.resources.items():
             if p not in steps or steps[p] > remaining:
                 continue
-            staleness = max(0.45, 1 - (frame.tick - resource["last_seen"]) * 0.006)
+            # Stage 1 has no rivals: a seen resource stays until we collect it.
+            staleness = 1.0 if c.stage == 1 else max(0.45, 1 - (frame.tick - resource["last_seen"]) * 0.006)
             # Race estimates use only currently visible competitors, never their private state.
             rival = min((manhattan(e["pos"], p) for e in enemies), default=1000)
             race = 0.45 if rival + 1 < steps[p] else 1.0
@@ -224,34 +237,35 @@ class Planner:
             urgency = 1.45 if c.stage == 2 and steps[p] <= rival + 1 <= steps[p] + 4 else 1.0
             goals.append({"pos": p, "base": self.resource_gain(frame, resource["value"]) * staleness * race,
                           "kind": "resource", "value": resource["value"], "expiry": c.horizon,
-                          "staleness": staleness, "race": race, "urgency": urgency})
+                          "staleness": staleness, "race": race, "urgency": urgency,
+                          "survive": self._survival(frame, p, resource["last_seen"], rivals)})
         done = set(frame.score.get("mission_completed_ids", []))
         if c.stage == 2:
             for mission in frame.missions:
                 p = mission.get("position")
                 if mission["type"] == "reach" and mission["id"] not in done and p in steps:
                     goals.append({"pos": p, "base": 5.5, "kind": "mission", "value": 0, "expiry": c.horizon})
-            for p, reward, expiry, kind in events.opportunities(frame, history):
+            for p, reward, expiry, label in events.opportunities(frame, history):
                 if p in steps and frame.tick + steps[p] < expiry:
-                    goals.append({"pos": p, "base": reward, "kind": kind, "value": 0, "expiry": expiry})
-            fade = max(0.0, 1 - frame.tick / 150)
-            if c.explore_weight and fade:
-                frontier = []
-                unseen = self._unseen_counter(frame)
-                for p in steps:
-                    if 0 < steps[p] <= remaining:
-                        gain = unseen(p)
-                        if gain:
-                            frontier.append((gain / (costs[p] + 2.5) ** 0.85, gain, p))
-                for _, gain, p in sorted(frontier, reverse=True)[:2]:
-                    goals.append({"pos": p, "base": self.explore_value(frame, gain),
-                                  "kind": "explore", "value": 0, "expiry": c.horizon})
+                    goals.append({"pos": p, "base": reward, "kind": label, "value": 0, "expiry": expiry})
+        if c.explore_weight and self.explore_value(frame, 1):
+            # Stage 2 weights unseen cells by the chance rivals have not swept them first.
+            frontier = []
+            unseen = self._unseen_counter(frame, self._territory(frame, events, steps) if c.stage == 2 else None)
+            for p in steps:
+                if 0 < steps[p] <= remaining:
+                    gain = unseen(p)
+                    if gain:
+                        frontier.append((gain / (costs[p] + 2.5) ** 0.85, gain, p))
+            for _, gain, p in sorted(frontier, reverse=True)[:2]:
+                goals.append({"pos": p, "base": self.explore_value(frame, gain),
+                              "kind": "explore", "value": 0, "expiry": c.horizon})
 
         # Candidate truncation is based on reachable value/distance, not input ordering.
         def initial_reward(g):
-            counts = Counter({"high_resources" if g["value"] >= 20 else "normal_resources": 1,
-                              "planned_value": g["value"]})
-            return (g["base"] + (self._mission_bonus(frame, g["value"], counts) if c.stage == 2 and g["value"] else 0)) * g.get("urgency", 1)
+            counts = Counter({kind(g["value"]): 1, "planned_value": g["value"]})
+            survive = g["survive"](steps[g["pos"]]) if "survive" in g else 1.0
+            return (g["base"] * survive + (self._mission_bonus(frame, g["value"], counts) if c.stage == 2 and g["value"] else 0)) * g.get("urgency", 1)
         goals.sort(key=lambda g: (-initial_reward(g) / (steps[g["pos"]] + 2), g["pos"], g["kind"]))
         goals = goals[:20]
         pair = {frame.position: (costs, steps)}
@@ -259,6 +273,17 @@ class Planner:
             if g["pos"] not in pair:
                 gc, gs, _ = self.distances(g["pos"], frame, events)
                 pair[g["pos"]] = gc, gs
+        known = [g["pos"] for g in goals if g["kind"] == "resource"]
+        if c.stage == 1 and known and len(memory.ever_seen) >= c.resource_count and len(known) <= 12:
+            # Every published resource has been seen, so the rest is deterministic: the exact
+            # optimal order (bitmask DP), recomputed only when the remaining set changes.
+            if self.exact[0] != frozenset(known):
+                points = [frame.position] + known
+                d = [[pair[a][1].get(b, 10 ** 9) for b in points] for a in points]
+                _, _, order = solve(d, [memory.resources[p]["value"] for p in known], remaining)
+                self.exact = frozenset(known), [known[i] for i in order]
+            if self.exact[1]:
+                return self._route_to(self.exact[1][0], parent, frame, events, history, "resource_exact", 1.0)
         if c.stage == 1 and goals:
             # Minimize a tour of all known resources when the time budget permits.
             # This avoids value-ratio detours while retaining reward search near expiry.
@@ -318,13 +343,13 @@ class Planner:
                     new_counts = counts.copy()
                     bonus = 0.0
                     if g["value"] and c.stage == 2:
-                        key = "high_resources" if g["value"] >= 20 else "normal_resources"
-                        new_counts[key] += 1
+                        new_counts[kind(g["value"])] += 1
                         new_counts["planned_value"] += g["value"]
                         bonus = self._mission_bonus(frame, g["value"], new_counts)
                     base_reward = g["base"]
                     if g["value"] and c.stage == 2:
-                        base_reward = self.resource_gain(frame, g["value"], counts["planned_value"]) * g["staleness"] * g["race"]
+                        base_reward = (self.resource_gain(frame, g["value"], counts["planned_value"])
+                                       * g["staleness"] * g["race"] * g["survive"](arrival))
                     urgency = g.get("urgency", 1) if depth == 0 else 1.0
                     new_reward = reward + (base_reward + bonus) * urgency * (0.91 ** depth)
                     efficiency = new_reward / (arrival + 3.5) ** 0.78
@@ -355,7 +380,20 @@ class Planner:
                             and (p[0] == target[0] or p[1] == target[1])):
                         engagements.append((costs[p], enemy["team"], p))
             if engagements:
-                _, _, target = min(engagements)
+                _, team, target = min(engagements)
+                enemy = next(e for e in enemies if e["team"] == team)
+                # Two robots that each step to line up with the other cross every tick. Attacks resolve
+                # before moves, so while a moving enemy can step into our line we wait for it (on an even or
+                # better exchange), on half the ticks so a rival using the same rule cannot mirror us. Only
+                # below the damage cap: past it our damage scores nothing while the enemy's still may.
+                me = frame.position
+                lines_up = any(1 <= manhattan(q, me) <= c.attack_range and (q[0] == me[0] or q[1] == me[1])
+                               and q not in memory.obstacles
+                               for q in (add(enemy["pos"], d) for d in DIRECTIONS.values()))
+                if (enemy.get("moved") and lines_up and target != me and frame.own["hp"] >= enemy["hp"]
+                        and frame.score.get("effective_damage", 0) < c.damage_cap
+                        and not enemy.get("protected", False) and hash((frame.tick, ord(c.team[0]))) % 2 == 0):
+                    target = me
                 return self._route_to(target, parent, frame, events, history, "engage", 1.2)
         if c.stage == 2:
             sightings = [(costs[s["pos"]] + (frame.tick - s["tick"]) * 0.25,
@@ -397,22 +435,57 @@ class Planner:
         return Route()
 
     def explore_value(self, frame, unseen):
-        """Expected points behind `unseen` cells: the published resource count spread over
-        this match's map at the published mean value, fading out by Tick 150 as the pool empties."""
-        c = self.config
-        density = c.resource_count / (frame.width * frame.height)
-        fade = max(0.0, 1 - frame.tick / 150)
-        return c.explore_weight * unseen * density * (c.resource_total / c.resource_count) * 0.25 * fade
+        """Expected points behind `unseen` cells: the published resource total not yet seen
+        this match, spread over the cells not yet seen. Stage 2 fades it out by Tick 150 as
+        rivals empty the pool; alone in stage 1, by the end of the match as time to collect
+        what is found runs out."""
+        c, m = self.config, self.memory
+        left = max(0.0, c.resource_total - sum(m.ever_seen.values()))
+        cells = max(1, frame.width * frame.height - len(m.seen))
+        fade = max(0.0, 1 - frame.tick / (150 if c.stage == 2 else c.horizon))
+        per_value = 0.25 if c.stage == 2 else self.resource_gain(frame, 1.0)
+        return c.explore_weight * unseen * left / cells * per_value * fade
 
-    def _unseen_counter(self, frame):
-        """Unseen cells in the vision window around p, via a 2D prefix sum built once per call
-        (O(1) per query instead of rescanning the (2r+1)^2 window)."""
+    def _survival(self, frame, p, last_seen, rivals):
+        """Chance a resource seen at p on tick `last_seen` is still there after `arrival`
+        more ticks: the rival sweep model conditioned on it having been present then."""
+        before = max(1e-6, self._clear(p, last_seen, rivals))
+        return lambda arrival: min(1.0, self._clear(p, frame.tick + arrival, rivals) / before)
+
+    def _rival_reach(self, frame, events):
+        """Step maps of the hypothesised rivals: at the rotations of our own spawn about the
+        map centre (90/180/270 degrees on square maps, else 180), sweeping out from Tick 0."""
+        w, h, (x, y) = frame.width, frame.height, self.memory.spawn or frame.position
+        images = [(w - 1 - y, x), (w - 1 - x, h - 1 - y), (y, h - 1 - x)] if w == h else [(w - 1 - x, h - 1 - y)]
+        return [self.distances(q, frame, events)[1] for q in set(images) - {(x, y)}
+                if q not in self.memory.obstacles]
+
+    @staticmethod
+    def _clear(p, t, rivals):
+        """Chance that no hypothesised rival has reached cell p by tick t: rival j covers
+        it with probability sigmoid((t - t_j) / 3), t_j its steps from its spawn."""
+        chance = 1.0
+        for rival in rivals:
+            if p in rival:
+                chance *= 1 - 1 / (1 + math.exp(max(-50.0, min(50.0, (rival[p] - t) / 3))))
+        return chance
+
+    def _territory(self, frame, events, steps):
+        """Chance that each cell is still unvisited by rivals when we can first get there."""
+        rivals = self._rival_reach(frame, events)
+        return {p: self._clear(p, frame.tick + d, rivals) for p, d in steps.items()}
+
+    def _unseen_counter(self, frame, weight=None):
+        """Unseen cells (each counted by `weight`, default 1; unreachable cells by 0 when a
+        weight map is given) in the vision window around p, via a 2D prefix sum built once
+        per call (O(1) per query instead of rescanning the (2r+1)^2 window)."""
         w, h, r, seen = frame.width, frame.height, frame.radius, self.memory.seen
         table = [[0] * (w + 1) for _ in range(h + 1)]
         for y in range(h):
             row, above, run = table[y + 1], table[y], 0
             for x in range(w):
-                run += (x, y) not in seen
+                if (x, y) not in seen:
+                    run += 1 if weight is None else weight.get((x, y), 0.0)
                 row[x + 1] = above[x + 1] + run
         def count(p):
             x0, x1 = max(0, p[0] - r), min(w, p[0] + r + 1)

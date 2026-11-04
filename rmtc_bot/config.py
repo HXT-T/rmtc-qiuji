@@ -23,6 +23,11 @@ class Config:
     # >0 lets frontier cells compete with resources/missions at their expected
     # resource value during the opening (fades to zero by Tick 150).
     explore_weight: float = 1.0  # adopted: batch-perf8-reconfirm500 (fresh distinct 24x24 maps, 500 ms, SPRT H1)
+    # Own effective damage per tick before the match shows its own rate (practice average
+    # of freeze-1030, about 900 over 500 ticks); see scoring.damage_value.
+    damage_rate_prior: float = 1.8
+    # Stage-1 self-study: path to a known map (eval/maps/stage1.json) for the exact route.
+    route_map: str = ""
     ai_url: str = "http://127.0.0.1:8080/v1/chat/completions"
     ai_model: str = "deepseek-flash"  # handbook and gateway sample: the unified model
     # Upstream may take up to 30 s; a client timeout below the model latency still consumes quota.
@@ -66,6 +71,8 @@ class Config:
         from .protocol import number
         if not number(self.kill_reward) or not number(self.death_penalty):
             raise ValueError("kill reward and death penalty must be finite and nonnegative")
+        if not 0 <= self.damage_rate_prior <= 100 or type(self.route_map) is not str:
+            raise ValueError("invalid planner limits")
         if not (0.1 <= self.ai_timeout <= 30 and self.ai_min_interval >= 0.2 and self.ai_max_inflight in (1, 2)
                 and 128 <= self.ai_max_tokens <= 16000 and type(self.ai_json_mode) is bool and type(self.ai_disable_thinking) is bool and type(self.ai_relative_time) is bool and self.ai_max_calls >= 0
                 and self.ai_max_age >= 0):

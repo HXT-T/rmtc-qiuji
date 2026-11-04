@@ -1,18 +1,18 @@
 # 秋天 · RMTC 参赛程序
 
 Ubuntu 22.04 / ROS 2 Humble / Python 3.10。核心仅用 Python 标准库，ROS 端需要 `rclpy`、`std_msgs`。同一份代码覆盖两个阶段，
-启动时由 `--stage` 选择分支，两阶段在第一阶段开始前一并封存（规则 §2.3）。技术说明见 [docs/技术报告.md](docs/技术报告.md)，
-检录操作见 [docs/检录清单.md](docs/检录清单.md)。
+启动时由 `--stage` 选择分支，两阶段在第一阶段开始前一并封存（规则 §2.3）。算法设计与变更记录见
+[docs/算法设计.md](docs/算法设计.md)。
 
 ## 运行环境与构建
 
 - 系统与依赖：Ubuntu 22.04（x86_64）、ROS 2 Humble（自带 `rclpy`、`std_msgs`）、Python 3.10；不需要 pip 安装任何第三方包。
 - 构建：Python 程序**无需编译**。`python3 -m rmtc_bot doctor` 确认环境可用。
-- 启动目录：**仓库根目录**（克隆后的 `rmtc-qiutian/`），所有命令都在这里执行，比赛时不要运行其他目录的同名程序。
+- 启动目录：**仓库根目录**（克隆后的 `rmtc-qiuji/`），所有命令都在这里执行，比赛时不要运行其他目录的同名程序。
 
 ```bash
-git clone https://github.com/HXT-T/rmtc-qiutian.git
-cd rmtc-qiutian
+git clone https://github.com/HXT-T/rmtc-qiuji.git
+cd rmtc-qiuji
 ```
 
 ## 目录
@@ -52,7 +52,7 @@ run.sh           练习启动脚本（默认 ROS 域 27，仅用于练习）
 模型固定为 `deepseek-flash`，`max_tokens` 为 512，并关闭思考（`thinking: disabled`），均已写在程序里。
 
 ```bash
-cd rmtc-qiutian
+cd rmtc-qiuji
 source /opt/ros/humble/setup.bash
 export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
@@ -67,7 +67,7 @@ bash scripts/run_contestant.sh --stage 2 --team 本场席位 --domain-id 本场�
 第一阶段（只用 A 席位，不需要 AI 网关与令牌）：
 
 ```bash
-cd rmtc-qiutian
+cd rmtc-qiuji
 source /opt/ros/humble/setup.bash
 export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp

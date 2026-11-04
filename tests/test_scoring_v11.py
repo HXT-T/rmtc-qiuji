@@ -30,8 +30,10 @@ class ScoringV11Tests(unittest.TestCase):
             e = Engine(Config(explore_weight=1.0))
             e.step(frame(tick=0, map={"width": size, "height": size}))
             values[size] = e.planner.explore_value(e.latest, 81)
-        self.assertAlmostEqual(values[18], 81 * 16 / 324 * 12.5 * 0.25)
-        self.assertAlmostEqual(values[24] / values[18], 324 / 576)  # sparser on the 24x24 stage-2 map
+            seen = len(e.planner.memory.seen)
+        # The unseen total (200) spreads over the cells not yet seen (all but the first view).
+        self.assertAlmostEqual(values[18], 81 * 200 / (324 - seen) * 0.25)
+        self.assertAlmostEqual(values[24] / values[18], (324 - seen) / (576 - seen))  # sparser on 24x24
 
     def test_multiple_deaths_and_environment_no_reward(self):
         self.assertEqual(after_tick(150, deaths=2), 30)

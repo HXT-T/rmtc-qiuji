@@ -4,3 +4,5 @@ work/
 __pycache__/
 *.pyc
 *.jsonl
+# Local secrets (real-LLM key for the practice referee).
+.env

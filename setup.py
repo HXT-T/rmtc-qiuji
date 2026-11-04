@@ -1,6 +1,6 @@
 from setuptools import setup
 
-setup(name="rmtc_bot", version="1.0.0", packages=["rmtc_bot"],
+setup(name="rmtc_bot", version="1.0.0", packages=["rmtc_bot"], package_data={"rmtc_bot": ["duel.json"]},
       data_files=[("share/ament_index/resource_index/packages", ["resource/rmtc_bot"]),
                   ("share/rmtc_bot", ["package.xml"])],
       install_requires=["setuptools"], python_requires=">=3.10",
