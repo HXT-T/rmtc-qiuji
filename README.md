@@ -1,98 +1,95 @@
-# 秋天 · RMTC 参赛程序
+# 秋天 · RMTC 案例研究
 
-Ubuntu 22.04 / ROS 2 Humble / Python 3.10。核心仅用 Python 标准库，ROS 端需要 `rclpy`、`std_msgs`。同一份代码覆盖两个阶段，
-启动时由 `--stage` 选择分支，两阶段在第一阶段开始前一并封存（规则 §2.3）。算法设计与变更记录见
-[docs/算法设计.md](docs/算法设计.md)。
+RMTC 机甲大师图灵对决赛（校内实验室算法组考核赛）的一个参赛程序，以及赛后围绕它做的算法研究。比赛已经结束，本仓库不再用于参赛，只作为**算法设计与改进方法**的案例研究保留：在一个四人、信息不完整、有时间限制的对抗游戏里，怎样用有证据的方法一步步改进算法。
 
-## 运行环境与构建
+完整的设计、证据与变更记录见 [docs/算法设计.md](docs/算法设计.md)，评测平台见 [eval/README.md](eval/README.md)，对比赛设计本身的检验见 [docs/赛制公平性.md](docs/赛制公平性.md)。
 
-- 系统与依赖：Ubuntu 22.04（x86_64）、ROS 2 Humble（自带 `rclpy`、`std_msgs`）、Python 3.10；不需要 pip 安装任何第三方包。
-- 构建：Python 程序**无需编译**。`python3 -m rmtc_bot doctor` 确认环境可用。
-- 启动目录：**仓库根目录**（克隆后的 `rmtc-qiuji/`），所有命令都在这里执行，比赛时不要运行其他目录的同名程序。
+## 问题
 
-```bash
-git clone https://github.com/HXT-T/rmtc-qiuji.git
-cd rmtc-qiuji
-```
+- **第一阶段**：单车在 20×20 未知地图上 100 Tick 内采集资源（100 ms/Tick）。
+- **第二阶段**：四车同场 500 Tick（500 ms/Tick），24×24 地图，视野 9×9。
+  - 得分 = 资源 30·min(R/120, 1) + 对抗 15·min(D/500, 1) + 三项任务各 5 分，满分 60。
+  - 攻击按移动前坐标结算，没有随机命中。
+  - 资源每场 200，被四队拿光即止，是零和的。
 
-## 目录
+## 设计理念
+
+1. **一个刻度**：所有选择都换算成终局期望得分（含封顶、同分规则、阵亡扣分），不用互相补偿的经验项。
+2. **模型先校准，再搜索**：每个概率模型先在裁判真值上校准（可靠性表、对数似然），再交给搜索使用。未校准的模型会被搜索放大误差。
+3. **先量化上限**：动手前估计这个方向最多能收回多少分，低于对局检测下限的方向不做。
+4. **逐决策审计**：平均成绩之外，检查每个决策是否合理，并亲自看最差的局。
+5. **预注册判定**：改动前写下预测和判定标准，用配对对局验证，标注证据强度。
+6. **方向对就打磨**：方向正确但测试持平的改动，要找到机理再修，不直接丢弃。
+
+## 方法
+
+| 层 | 做法 |
+|---|---|
+| 世界模型 | 地图记忆；未见区资源按公布的个数与总值做后验；对手扫掠模型：出生点最近的对手在到达时取走资源的概率 0.49，第二近 0.08，其余 0.02，否则每 Tick 0.006（4149 对资源—对手校准） |
+| 路线 | 束搜索资源 / 任务 / 探索路线，目标 = 期望得分 − 时间价格 |
+| 战术 | 每 Tick 为攻击、防御、移动、等待打分；空地一对一按精确博弈解查表：每个状态是同时行动的矩阵博弈，用 Shapley 值迭代 + 线性规划求解，收益按四队结构（我方伤害 − ⅓ 对方伤害） |
+| 第一阶段 | 探索价值按剩余资源的后验计算；资源全部已见且 ≤ 12 颗时用状态压缩 DP 求精确路线 |
+
+## 改进过程
+
+每次改动走同一个流程（文档第 6 节）：
+
+1. 提出机理与预测；
+2. 用帧日志离线重放和逐决策审计找到问题；
+3. 量化上限；
+4. 写下判定标准；
+5. 在标准 100 格上配对对局：9 张练习图 + 16 张随机图，各 4 个席位轮换；
+6. 把结果记入证据台账，无论成败。
+
+| 被采用的改动 | 内容 | 证据 |
+|---|---|---|
+| v5 | 伤害与阵亡按终局计价 | 去掉它资源 −6 |
+| v6–v8 | 领地加权探索、已见资源存活、未见区后验 | 第一 55% 对 15%（40 场） |
+| 第一阶段 | 后验探索价值、精确 DP 收尾 | 401 张图 +1.12 ± 0.57 |
+| s7 | 后期伤害未封顶时打破对峙 | 领先 +0.80 ± 0.40 |
+| d3 | 空地一对一精确解 | 第一 +0.03 ± 0.03（弱） |
+
+**当前最佳**（v8 + s7 + d3，`main`）：1 个本程序对 3 个封存版 q1030，第一率 **0.46 ± 0.05**（实力相当时为 0.25），与每个对手比总分胜 **66%**。
+
+研究中、尚未采用的方向（文档第 6.4、9 节）：
+
+| 方向 | 结果 |
+|---|---|
+| m1 校准的对手模型 + 边际任务价值 | 开局更好，中局输在双方互等；对 base 资源 −3.3 |
+| m2 = m1 + 等待承担推迟的风险 | 互等从每场 14 Tick 降到 1.4；对 m1 领先 +2.7 ± 1.0，对 base 不分胜负 |
+| m3 中局遭遇进精确博弈 | 量化后可收回 < 0.5 分/场，不实现 |
+
+## 教训
+
+- **先验证测量工具。** 100 ms/Tick 下超过约 100 ms 的决策会被丢弃，同一版本重跑就有 −0.09 的第一率差。改成 250 ms 后，36 格里 34 格逐格相同。
+- **平均成绩会掩盖荒唐的单步。** 旧的最佳版本平均很强，却会放弃离自己最近的高价值资源，原因是三个模型错误叠加：按直线判竞速、用假想对手代替看见的对手、恒定风险。
+- **搜索会放大模型误差。** 第一阶段的全局路线计划比局部规则差 2–15 分/图。
+- **单独“改准”一项会打破旧的平衡。** 只把存活估计改准，资源反而少 7：其他经验项是围绕旧的悲观调出来的，所以要整体重写成一个刻度。
+- **诊断要到机理。** m1 的损失不在对手模型（它在 2.3 万个样本上基本校准），而在战术层把推迟的风险当成避开的风险。量出“停着的对手下个 Tick 继续停”的概率（停 2 Tick 后 0.83，3 Tick 后 0.99）后，修正是一个模型，而不是一个参数。
+- **用户的直觉要经过检验。** 例如“僵持时先防御看对方反应”：精确解在斜对角几乎从不防御，因为此时谁也打不到谁；打还是走取决于 HP，而不取决于对方让不让。
+
+## 赛制公平性（摘要）
+
+评测数据也能检验比赛设计本身。主要发现：
+- 练习图上席位偏差很大，图 1 的 D 席拿第一的比例是 80%；
+- 偶数尺寸地图上的单格目标天然偏向一个席位；
+- 得分封顶后，第一名由决胜项决定，几乎为零的分差被放大成很大的第一率差距；
+- 每轮单场，赛制的识别力很低。
+
+详见 [docs/赛制公平性.md](docs/赛制公平性.md)，其中附有游戏平衡与赛制设计的相关研究。
+
+## 仓库结构
 
 ```text
-rmtc_bot/
-  __main__.py    命令行：run / replay / analyze / doctor
-  ros_node.py    ROS 2 适配：收感知与公告，发动作与队名
-  protocol.py    感知解析与校验，动作格式
-  engine.py      每 Tick 主流程与动作打分
-  planner.py     地图记忆、寻路、目标选择（束搜索）
-  events.py      校验模型输出，查询事件效果
-  ai.py          统一 AI 网关客户端（后台线程）
-  scoring.py     v1.1 计分公式
-  policies.py    四种决策类型
-  audit.py       JSONL 审计日志与赛后分析
-  config.py      全部可封存参数
-config/          default.json（封存参数）、decision_config.json（现场唯一可切换项 decision_type）
-scripts/         run_contestant.sh：正式比赛启动器（严格模式，令牌绑定本场）
-tests/           单元、HTTP、适配与多 Tick 场景测试（95 项）
-run.sh           练习启动脚本（默认 ROS 域 27，仅用于练习）
+rmtc_bot/   程序本体：ros_node / protocol / engine（战术、一对一查表）/ planner（记忆、寻路、束搜索）/ events / ai / scoring
+eval/       评测平台：批量对局、逐格配对、帧日志重放、逐决策审计、一对一精确解求解器
+docs/       算法设计.md（设计理念 → 模型 → 方法 → 验证 → 证据台账 → 反思 → 路线图）、赛制公平性.md
+tests/      95 项单元与场景测试
+config/     参数文件
 ```
 
-## 正式比赛启动
-
-接入信息全部在启动时配置，无需修改代码：
-
-| 项目 | 配置方式 |
-|---|---|
-| 阶段 | `--stage 1` 或 `--stage 2`，同一份代码 |
-| 席位 | `--team A/B/C/D`，话题 `/team_X/...` 自动对应 |
-| ROS 域 | `--domain-id 本场域编号` |
-| AI 网关地址 | 环境变量 `RMTC_AI_URL`，完整地址以 `/v1/chat/completions` 结尾 |
-| 本场令牌 | 环境变量 `RMTC_TEAM_TOKEN`，只在本终端隐藏输入，不写入命令行、文件或日志 |
-| 决策类型 | `config/decision_config.json` 的 `decision_type` |
-
-模型固定为 `deepseek-flash`，`max_tokens` 为 512，并关闭思考（`thinking: disabled`），均已写在程序里。
-
-```bash
-cd rmtc-qiuji
-source /opt/ros/humble/setup.bash
-export ROS_LOCALHOST_ONLY=0
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export RMTC_AI_URL='http://裁判通知地址:端口/v1/chat/completions'
-read -rsp '本场席位令牌: ' RMTC_TEAM_TOKEN; echo
-export RMTC_TEAM_TOKEN
-# 不要设置 RMTC_AI_MODEL：比赛只允许 deepseek-flash，设置其他模型会拒绝启动
-bash scripts/run_contestant.sh --stage 2 --team 本场席位 --domain-id 本场域编号 --name '秋天' \
-  --config config/default.json --decision-config config/decision_config.json --log logs/match.jsonl
-```
-
-第一阶段（只用 A 席位，不需要 AI 网关与令牌）：
-
-```bash
-cd rmtc-qiuji
-source /opt/ros/humble/setup.bash
-export ROS_LOCALHOST_ONLY=0
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-bash scripts/run_contestant.sh --stage 1 --team A --domain-id 本场域编号 --name '秋天' \
-  --config config/default.json --decision-config config/decision_config.json --log logs/stage1.jsonl
-```
-
-- 严格模式不默认 ROS 域；第二阶段必须提供网关和令牌。令牌绑定进程看到的第一场；换场后须带新令牌重启（日志 `token_refresh_required`）。
-- 同场重启按感知位置恢复；同 Tick 重发感知只返回缓存动作，不推进策略。最终帧只读取回执和分数，不再发布动作。
-- 现场只允许修改 `decision_config.json` 中的 `decision_type`（balanced / collect / combat / survive），批准后重启生效。
-
-## 运行逻辑
-
-每个 Tick：`ros_node` 收到本席位感知 → `protocol` 校验 → `planner` 更新地图记忆 → 新公告交给 `ai` 后台线程由大模型理解（不阻塞本 Tick），
-`events` 校验模型输出 → `planner` 选目标（束搜索）→ `engine` 为攻击、防御、移动、等待打分取最高 → 回填本帧 tick 与 session_id 发布动作，`audit` 写日志。
-
-## 自检
-
-```bash
-python3 -m rmtc_bot doctor                                   # 运行环境只读检查
-python3 -m unittest discover -s tests -t . -q                # 95 项测试
-python3 -m rmtc_bot replay --stage 1 --input 感知.jsonl --log logs/replay.jsonl   # 离线回放，不发 HTTP/ROS
-python3 -m rmtc_bot analyze logs/match.jsonl                 # 赛后审计
-```
+复现评测需要 WSL / Ubuntu 22.04 + ROS 2 Humble 与官方练习裁判，步骤见 [eval/README.md](eval/README.md)。单元测试：`python3 -m unittest discover -s tests -t . -q`。比赛封存版是提交 [`059875d`](https://github.com/HXT-T/rmtc-qiuji/tree/059875d)（freeze-1030），也就是对照对手 q1030。
 
 ## 开发说明
 
-本项目使用 AI 辅助开发：前期使用 ChatGPT，后续使用 Claude（Anthropic）协助完成算法迭代、测试平台与文档。
+本项目使用 AI 辅助开发：前期使用 ChatGPT，后续使用 Claude（Anthropic）协助完成算法迭代、评测平台、数据分析与文档。
