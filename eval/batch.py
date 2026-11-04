@@ -131,8 +131,8 @@ def main():
     for item in args.bot:
         name, path = item.split("=", 1)
         versions[name] = str(Path(path).expanduser().resolve())
-        if not (Path(versions[name]) / "rmtc_bot").is_dir():
-            parser.error(f"{path} has no rmtc_bot package")
+        if not any((Path(versions[name]) / f).exists() for f in ("rmtc_bot", "run_bot.sh")):
+            parser.error(f"{path} has neither an rmtc_bot package nor run_bot.sh")
     lineup = args.lineup.split(",")
     if len(lineup) != 4 or any(b not in ("ref", "thief") and b not in versions for b in lineup):
         parser.error("lineup needs 4 entries, each 'ref', 'thief' or a --bot name")

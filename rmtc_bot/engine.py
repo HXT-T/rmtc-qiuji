@@ -191,10 +191,14 @@ class Engine:
         return self.events.fortress_power(fake, history)
 
     def _incoming(self, frame, enemies, defending=False, future_position=None):
+        return sum(damage * p for damage, p in self._hits(frame, enemies, defending, future_position))
+
+    def _hits(self, frame, enemies, defending=False, future_position=None):
+        """Possible hits on us this tick: (damage, probability the enemy attacks), one per enemy."""
         if frame.own.get("protected", False) and future_position is None:
-            return 0.0
+            return []
         p = future_position or frame.position
-        total = 0.0
+        hits = []
         for e in enemies:
             if e.get("protected", False):
                 continue
@@ -218,8 +222,9 @@ class Engine:
                 damage = self.config.defended_damage if defending else self.config.attack_damage
             if hittable:
                 # Last defending flag is evidence of a tendency, never a guaranteed action.
-                total += damage * (0.5 if e.get("defending", False) else 0.85)
-        return total * self.events.vulnerable(frame.tick, self.history)
+                hits.append((damage * self.events.vulnerable(frame.tick, self.history),
+                             0.5 if e.get("defending", False) else 0.85))
+        return hits
 
     def _targets(self, frame, enemies, direction, power):
         if power:
@@ -238,7 +243,8 @@ class Engine:
         """The simplest tactical case, played exactly (eval/duel.py): nothing left to collect or explore,
         one visible enemy within 4 steps, nobody protected, no known events, open ground around both robots."""
         memory, done = self.planner.memory, frame.score.get("mission_completed_ids", [])
-        if (len(enemies) != 1 or memory.resources or self.planner.explore_value(frame, 1) or self.events.events
+        if (len(enemies) != 1 or memory.resources or self.planner.explore_value(frame, 1)
+                or any(e.end > frame.tick for e in self.events.events.values())
                 or frame.own.get("protected", False)
                 or enemies[0].get("protected", False) or any(m["id"] not in done for m in frame.missions)):
             return None
@@ -279,8 +285,8 @@ class Engine:
             return action(frame, "wait"), "event_death"
         power = self.events.fortress_power(frame, self.history)
         reflected = bool(self.events.active("reflection", frame.tick))
-        incoming = self._incoming(frame, enemies)
-        defended = self._incoming(frame, enemies, True)
+        hits, guarded = self._hits(frame, enemies), self._hits(frame, enemies, True)
+        incoming, defended = (sum(d * q for d, q in h) for h in (hits, guarded))
         survival_weight = {"balanced": 0.07, "collect": 0.10, "combat": 0.035, "survive": 0.18}[self.strategy]
         current_damage = frame.score.get("effective_damage", 0)
         pending_missions = any(m["id"] not in frame.score.get("mission_completed_ids", []) for m in frame.missions)
@@ -290,12 +296,22 @@ class Engine:
         def damage_reward(damage):
             reward = damage_value(frame, c, damage, tie_weight=tiebreak_weight)
             return reward * (1.6 if self.strategy == "combat" else 1.0)
-        def survival_loss(damage, own_gain=0):
-            # Approximate danger from public observations. v1.1 death also debits
-            # adjusted damage AFTER this tick's own damage and kill rewards.
+        def survival_loss(hits, extra=0.0, own_gain=0):
+            # Expected HP loss plus the death cost times the chance of dying: each enemy attacks
+            # independently, so death is P(extra + the hits that land >= hp), not E[damage] >= hp.
+            # v1.1 death also debits adjusted damage AFTER this tick's own damage and kill rewards.
             debit = (damage_value(frame, c, own_gain, tie_weight=tiebreak_weight)
                      - damage_value(frame, c, own_gain, deaths=1, tie_weight=tiebreak_weight))
-            return damage * survival_weight + (5.0 + debit if damage >= hp else 0.0)
+            outcomes = {extra: 1.0}
+            for damage, q in hits:
+                spread = {}
+                for total, w in outcomes.items():
+                    spread[total + damage] = spread.get(total + damage, 0.0) + w * q
+                    spread[total] = spread.get(total, 0.0) + w * (1 - q)
+                outcomes = spread
+            death = sum(w for total, w in outcomes.items() if total >= hp)
+            expected = extra + sum(d * q for d, q in hits)
+            return expected * survival_weight + death * (5.0 + debit)
         def kill_share(target):
             # Other visible robots can share a kill; their next actions are unknown.
             # Count plausible ordinary contributors conservatively, not as truth.
@@ -313,7 +329,7 @@ class Engine:
                         risk += event.params.get("damage", 50) * 0.4
             return risk
         stationary_fire = fire_risk(frame.position)
-        options = [(0.0 - survival_loss(incoming + stationary_fire), "wait", None, "idle")]
+        options = [(0.0 - survival_loss(hits, stationary_fire), "wait", None, "idle")]
         if defended < incoming:
             reflect_gain = 0.0
             if reflected and not frame.own.get("protected", False):
@@ -336,9 +352,9 @@ class Engine:
                         if can_hit:
                             reflect_gain += kill_share(target) * (0.5 if target.get("defending", False) else 0.85)
             options.append((damage_reward(reflect_gain) - 0.15
-                - survival_loss(defended + stationary_fire, reflect_gain), "defend", None, "reduce_incoming"))
+                - survival_loss(guarded, stationary_fire, reflect_gain), "defend", None, "reduce_incoming"))
         if route.reason == "fortress" and not route.direction:
-            options.append((1.2 - survival_loss(defended), "defend", None, "fortress_dwell"))
+            options.append((1.2 - survival_loss(guarded), "defend", None, "fortress_dwell"))
         if not frame.own.get("protected", False):
             for direction in DIRECTIONS:
                 targets = self._targets(frame, enemies, direction, power)
@@ -365,7 +381,7 @@ class Engine:
                     awards += kill_share(target) * lethal
                 if damage:
                     gain = damage + awards
-                    reward = damage_reward(gain) - survival_loss(incoming + backlash + stationary_fire, gain)
+                    reward = damage_reward(gain) - survival_loss(hits, backlash + stationary_fire, gain)
                     options.append((reward, "attack", direction, "damage_opportunity"))
         occupied = {e["pos"] for e in enemies}
         inverted = self.events.inverted(frame, self.history)
@@ -403,7 +419,7 @@ class Engine:
             current_future = self.events.hazard(frame.position, frame.tick + 1, False)
             if current_future and not future_hazard:
                 reward += 8.0
-            reward -= survival_loss(incoming + fire_risk(p, True)) + future_risk
+            reward -= survival_loss(hits, fire_risk(p, True)) + future_risk
             for event in self.events.active("vulnerability", frame.tick):
                 if (frame.tick < event.params.get("trigger_end", min(event.start + 20, event.end))
                         and self.events.vulnerable(frame.tick, self.history) == 1):

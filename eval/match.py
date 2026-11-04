@@ -83,7 +83,8 @@ def run_match(config, lineup, versions, practice_root, out_dir, port, domain,
                 raise RuntimeError("referee did not become ready")
             time.sleep(0.5)
         result["session_id"] = state["session_id"]
-        bot_env = dict({k: v for k, v in env.items() if not k.startswith("PRACTICE_LLM")}, RMTC_LOG_FRAMES="1")
+        bot_env = dict({k: v for k, v in env.items() if not k.startswith("PRACTICE_LLM")}, RMTC_LOG_FRAMES="1",
+                       RMTC_AI_URL=f"http://127.0.0.1:{port}/v1/chat/completions")
         for seat, bot in lineup.items():
             if bot == "ref":
                 continue
@@ -92,6 +93,10 @@ def run_match(config, lineup, versions, practice_root, out_dir, port, domain,
                 command = ["python3", str(Path(__file__).with_name("exploiters.py")),
                            "--team", seat, "--target", target_seat, "--port", str(port)]
                 cwd = None
+            elif (Path(versions[bot]) / "run_bot.sh").is_file():
+                # Another team's program behind a wrapper: run_bot.sh SEAT NAME OUT_DIR, gateway in env.
+                command = ["bash", "run_bot.sh", seat, bot, str(out)]
+                cwd = versions[bot]
             else:
                 command = ["python3", "-m", "rmtc_bot", "run", "--stage", str(stage), "--team", seat,
                            "--name", bot, "--ai-url", f"http://127.0.0.1:{port}/v1/chat/completions",

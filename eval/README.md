@@ -53,6 +53,21 @@ python3 eval/paired.py $E/runs/d3:d3 $E/runs/s7:s7 + $E/runs/d3r:d3 $E/runs/s7r:
 python3 eval/play.py
 ```
 
+### 对手池：其他队伍的公开程序
+
+版本目录里放一个 `run_bot.sh` 就能作为对手：`match.py` 以 `run_bot.sh 席位 队名 输出目录` 启动它，ROS 域、`RMTC_AI_URL`（本场裁判网关）和 `RMTC_TEAM_TOKEN` 从环境变量传入。三个 C++ 对手在 WSL 的 `~/rmtc-eval/opponents/` 下各自独立的 colcon 工作空间里编译（它们的代码不进本仓库），nlohmann/json 装在 `opponents/deps`：
+
+| 名字 | 来源 | 启动 |
+|---|---|---|
+| `ff` | github.com/faultfaust/rmtc（MIT），`match/stage2_ros2` | `ff_ws` 的 `rmtc_bot` |
+| `ls` | github.com/lishirun/rmtc-bot（v12，无许可证文件，只作本地研究） | `ls_ws` 的 `contestant` |
+| `mi` | github.com/Miraculy/RMTC_coding，`stage2/` 发布版 + `final.yaml` | `mi_ws` 的 `contestant` |
+
+```bash
+python3 eval/batch.py --practice $E/practice --bot base=$E/versions/base --bot ff=$E/versions/ff \
+  --bot ls=$E/versions/ls --bot mi=$E/versions/mi --lineup base,ff,ls,mi --out $E/runs/pool
+```
+
 `ref` 是官方陪练车 `robot_node`，`thief` 是 exploiter。每场的裁判日志、配置、各席位决策日志（含 `candidates` 候选动作分数）都在 `runs/<批次>/m<种子>_r<轮换>/` 下。
 
 ## 限制

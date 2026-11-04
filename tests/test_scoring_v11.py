@@ -85,5 +85,22 @@ class ScoringV11Tests(unittest.TestCase):
         self.assertNotEqual(engine.step(f)['action'],'attack')
 
 
+    def test_duel_resumes_once_known_events_have_ended(self):
+        def duel(tick):
+            engine = Engine(Config(explore_weight=0.0))
+            engine.step(frame())
+            engine.events.merge([Event('reflection', 1, 20, params={'reflection_damage': 20})])
+            engine.step(frame(tick=tick, entities=[enemy((4, 2))]))
+            enemies = [e for e in engine.latest.entities if e["type"] == "robot"]
+            return engine._duel(engine.latest, enemies)
+        self.assertIsNone(duel(10))  # active event: the table does not model it
+        self.assertIsNotNone(duel(30))
+
+    def test_single_likely_hit_that_would_kill_is_priced_as_death(self):
+        # Expected damage 0.85 x 20 = 17 < 20 HP, yet one hit kills with probability 0.85.
+        f = frame(entities=[enemy((4, 2)), resource((5, 5))], map={"width": 24, "height": 24})
+        f["self"]["hp"] = 20
+        self.assertEqual(Engine(Config()).step(f)["action"], "defend")
+
 if __name__=='__main__':
     unittest.main()
