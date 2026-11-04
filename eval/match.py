@@ -83,7 +83,7 @@ def run_match(config, lineup, versions, practice_root, out_dir, port, domain,
                 raise RuntimeError("referee did not become ready")
             time.sleep(0.5)
         result["session_id"] = state["session_id"]
-        bot_env = {k: v for k, v in env.items() if not k.startswith("PRACTICE_LLM")}
+        bot_env = dict({k: v for k, v in env.items() if not k.startswith("PRACTICE_LLM")}, RMTC_LOG_FRAMES="1")
         for seat, bot in lineup.items():
             if bot == "ref":
                 continue

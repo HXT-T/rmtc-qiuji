@@ -18,7 +18,9 @@ eval/
   .env       真实 LLM 配置（自己填 PRACTICE_LLM_KEY，已 gitignore）
   match.py   跑一场：启动裁判 → 启动各席位程序 → 恢复比赛 → 读取最终成绩
   batch.py   批量：每张地图按席位轮换跑多场，并行执行，输出汇总和配对比较
-  paired.py  逐格配对：候选批次对一个对照批次，或对多个安慰剂批次的逐格均值（--split-cap 按伤害是否封顶拆开；--cause 理由：拆出变体生效前就分叉的重跑噪声）
+  replay.py  帧日志离线重放：候选在对照的帧上第一次动作不同的 Tick（batch.py --screen 用它跳过相同的格）
+  audit.py   逐决策审计：看见时我们是所有机器人里最近、最后被对手拿走的资源（每场次数与价值，列出最差的局）
+  paired.py  逐格配对：候选批次对一个对照批次，或对多个安慰剂批次的逐格均值（--split-cap 按伤害是否封顶拆开；--cause 理由：拆出变体生效前就分叉的重跑噪声；+ 合并多组图；报告 mde）
   play.py    看一场：交互选地图、席位、对手、速度，浏览器打开裁判页面（桌面“RMTC 第二阶段对局.bat”调用它）
 ```
 
@@ -45,6 +47,8 @@ python3 eval/batch.py --practice $E/practice --out $E/runs/b1 --summary --compar
 python3 eval/paired.py $E/runs/b1:new $E/runs/p1:p1 $E/runs/p3:p3 --split-cap
 # 只改后期的变体与对照本身配对，按它的决策理由拆噪声
 python3 eval/paired.py $E/runs/d3:d3 $E/runs/s7:s7 --cause duel
+# 标准集 100 格（F + R1 + R2，见 docs/算法设计.md 3.0）用 + 合并成一次配对
+python3 eval/paired.py $E/runs/d3:d3 $E/runs/s7:s7 + $E/runs/d3r:d3 $E/runs/s7r:s7 + $E/runs/d3x:d3 $E/runs/s7x:s7 --cause duel
 # 看一场（端口 8090、ROS 域 60，不与批测槽位冲突）
 python3 eval/play.py
 ```
@@ -54,6 +58,6 @@ python3 eval/play.py
 ## 限制
 
 - 地图事件关闭（截图没有事件表）；`--ai-mode real` 时裁判代理 `.env` 里的模型，密钥不会传给参赛程序。
-- 默认 100 ms/Tick（正式 500 ms）。决策耗时 p99 约 9 ms，余量足够；但 AI 请求的相对延迟比正式比赛小。
+- 默认 250 ms/Tick（正式 500 ms）。决策中位数约 7 ms，但开局资源规划在负载下可到 170 ms；100 ms/Tick 会按负载丢动作，结果不可复现（docs/算法设计.md 3.3）。AI 请求的相对延迟比正式比赛小。
 - 9 张图来自截图提取，任务统一为两个普通、一个高价值、到达 [12,12]。
 - 每张地图跑 4 次席位轮换以抵消出生角差异。比较两个版本时看同场配对结果（`--compare`），样本少时置信区间会很宽。

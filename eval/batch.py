@@ -3,7 +3,9 @@
 Each map is played once per seat rotation of the lineup, so every bot starts from every
 spawn. Maps are the fixed validation set eval/maps/stage2_*.json plus fresh random maps
 (eval/maps.py, a new seed every run) as a held-out check. Results append to
-<out>/results.jsonl; `--summary` only reports.
+<out>/results.jsonl; `--summary` only reports. `--screen CONTROL_RUN:BOT` plays only the cells where the
+target bot would act differently from that control (eval/replay.py) and copies the control's result for
+the others, renamed to the target.
 
   python3 eval/batch.py --practice ~/rmtc_practice --bot new=~/eval/v/new \
       --lineup new,thief,ref,ref --target new --parallel 4 --out ~/eval/runs/x
@@ -11,6 +13,7 @@ spawn. Maps are the fixed validation set eval/maps/stage2_*.json plus fresh rand
 import argparse
 import json
 import math
+from collections import defaultdict
 import random
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from maps import generate  # noqa: E402
 from match import run_match  # noqa: E402
+from replay import screen  # noqa: E402
 
 SEATS = "ABCD"
 MAPS = Path(__file__).resolve().parent / "maps"
@@ -109,11 +113,12 @@ def main():
     parser.add_argument("--parallel", type=int, default=3)
     parser.add_argument("--first-slot", type=int, default=0,
                         help="port/ROS-domain slot of the first worker; give concurrent batches disjoint slots")
-    parser.add_argument("--tick-ms", type=int, default=100)
+    parser.add_argument("--tick-ms", type=int, default=250, help="250: no decision is late (contest: 500)")
     parser.add_argument("--max-ticks", type=int, default=500)
     parser.add_argument("--out", required=True)
     parser.add_argument("--compare", help="a,b: paired comparison of two bots")
     parser.add_argument("--summary", action="store_true", help="only summarize existing results")
+    parser.add_argument("--screen", help="CONTROL_RUN:BOT: play only cells where the target differs from it")
     args = parser.parse_args()
     out = Path(args.out).expanduser()
     out.mkdir(parents=True, exist_ok=True)
@@ -140,8 +145,22 @@ def main():
     for seed in [*numbers(args.maps), *fresh]:
         for shift in numbers(args.rotations):
             jobs.append((seed, shift, {SEATS[(i + shift) % 4]: lineup[i] for i in range(4)}))
-    print(f"{len(jobs)} matches, {args.parallel} in parallel, {args.tick_ms} ms/tick", flush=True)
     rows = []
+    if args.screen:
+        control_bot = args.screen.rsplit(":", 1)[1]
+        # A cell the control failed to play has no frames to screen with: play it.
+        cells = defaultdict(lambda: (None, 0), screen(args.screen, versions[target]))
+        rename = lambda name: target if name == control_bot else name
+        for row, tick in (cells[str(seed), shift] for seed, shift, _ in jobs):
+            if tick is None:
+                rows.append(dict(row, screened=True, lineup={s: rename(b) for s, b in row["lineup"].items()},
+                                 teams=[dict(t, bot=rename(t["bot"]), team_name=rename(t["bot"])) for t in row["teams"]]))
+        with results.open("a") as stream:
+            stream.writelines(json.dumps(r, ensure_ascii=False) + "\n" for r in rows)
+        jobs = [j for j in jobs if cells[str(j[0]), j[1]][1] is not None]
+        print(f"screened: {len(rows)} cells identical to {args.screen}", flush=True)
+    total = len(rows) + len(jobs)
+    print(f"{len(jobs)} matches, {args.parallel} in parallel, {args.tick_ms} ms/tick", flush=True)
 
     def work(slot, job):
         seed, shift, seats = job
@@ -175,7 +194,7 @@ def main():
                 stream.write(json.dumps(row, ensure_ascii=False) + "\n")
             line = row.get("error") or " ".join(f"{t['bot']}:{t['rank']}/{t.get('score', 0):.1f}"
                                                 for t in sorted(row["teams"], key=lambda t: t["rank"]))
-            print(f"[{len(rows)}/{len(jobs)}] seed {row['seed']} rot {row['rotation']}: {line}", flush=True)
+            print(f"[{len(rows)}/{total}] seed {row['seed']} rot {row['rotation']}: {line}", flush=True)
     summarize(rows, compare)
 
 
