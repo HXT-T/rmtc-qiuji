@@ -4,7 +4,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from .events import EventBook, validate_plan
-from .planner import Planner, add, manhattan
+from .planner import Planner, add, between, in_line, manhattan
 from .protocol import Frame, DIRECTIONS, OPPOSITE, action
 from .scoring import damage_value
 
@@ -14,24 +14,18 @@ DUEL = json.loads(Path(__file__).with_name("duel.json").read_text(encoding="utf-
 LOG_FRAMES = bool(os.environ.get("RMTC_LOG_FRAMES"))
 
 
+def bound(history, size=3000):
+    """Keep only the latest `size` ticks of an insertion-ordered tick history."""
+    while len(history) > size:
+        del history[next(iter(history))]
+
+
 class Engine:
     def __init__(self, config, ai=None, log=None):
         self.config, self.ai = config, ai
         self.log = log or (lambda *args, **kwargs: None)
-        self.session = None
-        self.retired_sessions = set()
-        self.tick = -1
-        self.cached = None
-        self.planner = Planner(config)
-        self.events = EventBook()
-        self.history = {}
-        self.enemy_history = {}
-        self.announcements = {}  # content identity; never parse text for mechanics
-        self.strategy = config.decision_type
-        self.latest = None
-        self.last_move_target = None
-        self.last_move_tick = -1
-        self.known = None
+        self.retired_sessions, self.latest, self.known = set(), None, None
+        self._fresh(None)
         if config.stage == 1 and config.route_map:
             # Planned once at start-up (about 2 s), before the first perception.
             from .known_map import KnownRoute
@@ -39,15 +33,19 @@ class Engine:
             self.log("known_route", value=self.known.plan["value"], moves=self.known.plan["moves"],
                      order=self.known.plan["order"])
 
+    def _fresh(self, session):
+        """Everything learned within one session."""
+        self.session, self.tick, self.cached = session, -1, None
+        self.planner, self.events = Planner(self.config), EventBook()
+        # announcements: content identity only; never parse text for mechanics
+        self.history, self.enemy_history, self.announcements = {}, {}, {}
+        self.strategy = self.config.decision_type
+        self.last_move_target, self.last_move_tick = None, -1
+
     def _reset(self, frame):
         if self.session is not None:
             self.retired_sessions.add(self.session)
-        self.session, self.tick, self.cached = frame.session, -1, None
-        self.planner, self.events = Planner(self.config), EventBook()
-        self.history, self.enemy_history, self.announcements = {}, {}, {}
-        self.strategy = self.config.decision_type
-        self.last_move_target = None
-        self.last_move_tick = -1
+        self._fresh(frame.session)
         if self.ai:
             self.ai.reset(frame.session)
         self.log("session", session_id=frame.session, first_tick=frame.tick,
@@ -142,16 +140,14 @@ class Engine:
                                         and receipt.get("moved") is True and self.cached
                                         and self.cached.get("direction") in OPPOSITE
                                         and receipt.get("effective_direction") == OPPOSITE[self.cached["direction"]])}
-        while len(self.history) > 3000:
-            del self.history[next(iter(self.history))]
+        bound(self.history)
         enemies = [e for e in frame.entities if e["type"] == "robot" and e["team"] != self.config.team]
         for e in enemies:
             history = self.enemy_history.setdefault(e["team"], {})
             previous = history.get(frame.tick - 1)
             e["moved"] = previous is not None and previous["position"] != e["pos"]
             history[frame.tick] = {"position": e["pos"], "alive": True, "moved": e["moved"]}
-            while len(history) > 3000:
-                del history[next(iter(history))]
+            bound(history)
         self.add_announcement(frame.event_text)
         self._poll_ai(frame)
         if self.ai:
@@ -204,27 +200,22 @@ class Engine:
                 continue
             power = self._enemy_power(e, frame)
             if power:
-                radius = power.params.get("attack_radius", 2)
-                hittable = max(abs(e["pos"][0] - p[0]), abs(e["pos"][1] - p[1])) <= radius
                 damage = power.params.get("defended_damage", 10) if defending else power.params.get("damage", 50)
             else:
-                hittable = ((p[0] == e["pos"][0] or p[1] == e["pos"][1])
-                            and 1 <= manhattan(p, e["pos"]) <= self.config.attack_range)
-                # The nearest other robot can shield us, even if protected.
-                if hittable:
-                    for other in enemies:
-                        if other is e:
-                            continue
-                        if (manhattan(e["pos"], other["pos"]) < manhattan(e["pos"], p)
-                                and manhattan(e["pos"], other["pos"]) + manhattan(other["pos"], p)
-                                == manhattan(e["pos"], p)):
-                            hittable = False
                 damage = self.config.defended_damage if defending else self.config.attack_damage
-            if hittable:
+            if self._reaches(e, p, enemies, power):
                 # Last defending flag is evidence of a tendency, never a guaranteed action.
                 hits.append((damage * self.events.vulnerable(frame.tick, self.history),
                              0.5 if e.get("defending", False) else 0.85))
         return hits
+
+    def _reaches(self, e, p, enemies, power):
+        """Enemy e can hit cell p: within a fortress power's square radius, else in its line of fire
+        unless the nearest other robot shields p, even a protected one."""
+        if power:
+            return max(abs(e["pos"][0] - p[0]), abs(e["pos"][1] - p[1])) <= power.params.get("attack_radius", 2)
+        return (in_line(e["pos"], p, self.config.attack_range)
+                and not any(other is not e and between(e["pos"], other["pos"], p) for other in enemies))
 
     def _targets(self, frame, enemies, direction, power):
         if power:
@@ -316,8 +307,7 @@ class Engine:
             # Other visible robots can share a kill; their next actions are unknown.
             # Count plausible ordinary contributors conservatively, not as truth.
             others = sum(1 for e in enemies if e is not target and not e.get("protected", False)
-                and (e["pos"][0] == target["pos"][0] or e["pos"][1] == target["pos"][1])
-                and 1 <= manhattan(e["pos"], target["pos"]) <= c.attack_range)
+                         and in_line(e["pos"], target["pos"], c.attack_range))
             return c.kill_reward / (1 + others)
         def fire_risk(position, moving=False):
             if frame.own.get("protected", False) and not moving:
@@ -336,21 +326,9 @@ class Engine:
                 amount = max(e.params.get("reflection_damage", 20)
                              for e in self.events.active("reflection", frame.tick))
                 for target in enemies:
-                    if target["hp"] <= amount and not target.get("protected", False):
-                        enemy_power = self._enemy_power(target, frame)
-                        distance = manhattan(target["pos"], frame.position)
-                        if enemy_power:
-                            can_hit = max(abs(target["pos"][0]-frame.position[0]),
-                                abs(target["pos"][1]-frame.position[1])) <= enemy_power.params.get("attack_radius", 2)
-                        else:
-                            can_hit = ((target["pos"][0] == frame.position[0] or target["pos"][1] == frame.position[1])
-                                and 1 <= distance <= c.attack_range
-                                and not any(other is not target
-                                    and manhattan(target["pos"], other["pos"]) < distance
-                                    and manhattan(target["pos"], other["pos"]) + manhattan(other["pos"], frame.position) == distance
-                                    for other in enemies))
-                        if can_hit:
-                            reflect_gain += kill_share(target) * (0.5 if target.get("defending", False) else 0.85)
+                    if (target["hp"] <= amount and not target.get("protected", False)
+                            and self._reaches(target, frame.position, enemies, self._enemy_power(target, frame))):
+                        reflect_gain += kill_share(target) * (0.5 if target.get("defending", False) else 0.85)
             options.append((damage_reward(reflect_gain) - 0.15
                 - survival_loss(guarded, stationary_fire, reflect_gain), "defend", None, "reduce_incoming"))
         if route.reason == "fortress" and not route.direction:

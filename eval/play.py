@@ -2,8 +2,9 @@
 seat, the opponents and the tick length; the referee's page opens in the Windows browser.
 
 Our bot is the working tree of this repository (the current best version). Opponents are the
-q1030 and v8 snapshots in ~/rmtc-eval/versions, the best version itself, the official reference
-robot ('ref') or the exploiter ('thief').
+q1030 and v8 snapshots in ~/rmtc-eval/versions, other teams' programs in the opponent pool (ff, ls,
+mi; eval/README.md), the best version itself, the official reference robot ('ref') or the
+exploiter ('thief').
 """
 import json
 import random
@@ -69,10 +70,11 @@ def main():
               else json.loads((MAPS / f"stage2_{seed}.json").read_text(encoding="utf-8")))
     seat = ask("我方席位", [(s, s) for s in SEATS])
     versions = {"best": str(ROOT)}
-    versions.update({name: str(EVAL / "versions" / name) for name in ("q1030", "v8")
-                     if (EVAL / "versions" / name / "rmtc_bot").is_dir()})
-    labels = {"q1030": "q1030（比赛提交版 freeze-1030）", "v8": "v8（上一版最佳，没有后期等待）"}
-    choices = [(labels[name], name) for name in ("q1030", "v8") if name in versions] + [
+    labels = {"q1030": "q1030（比赛提交版 freeze-1030）", "v8": "v8（上一版最佳，没有后期等待）",
+              "ff": "ff（faultfaust/rmtc，C++）", "ls": "ls（lishirun/rmtc-bot，C++）", "mi": "mi（Miraculy/RMTC_coding，C++）"}
+    versions.update({name: str(EVAL / "versions" / name) for name in labels
+                     if any((EVAL / "versions" / name / f).exists() for f in ("rmtc_bot", "run_bot.sh"))})
+    choices = [(labels[name], name) for name in labels if name in versions] + [
         ("best（当前最佳，自己对自己）", "best"), ("ref（官方陪练车）", "ref"), ("thief（读真值抢资源的 exploiter）", "thief")]
     opponents = iter(pick_opponents(choices))
     lineup = {s: "best" if s == seat else next(opponents) for s in SEATS}

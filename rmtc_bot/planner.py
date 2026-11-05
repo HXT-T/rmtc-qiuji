@@ -15,6 +15,16 @@ def manhattan(a, b):
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 
+def in_line(a, b, reach):
+    """An ordinary attack from a reaches b: same row or column, 1 to `reach` cells."""
+    return (a[0] == b[0] or a[1] == b[1]) and 1 <= manhattan(a, b) <= reach
+
+
+def between(a, c, b):
+    """c lies on a shortest path from a to b, nearer to a than b is: it shields b from a."""
+    return manhattan(a, c) < manhattan(a, b) and manhattan(a, c) + manhattan(c, b) == manhattan(a, b)
+
+
 def kind(value):
     """Mission category of a resource by its value."""
     return "high_resources" if value >= 20 else "normal_resources"
@@ -48,9 +58,7 @@ class WorldMemory:
                         if ((p[0] == event.point[0] or p[1] == event.point[1])
                                 and event.start <= self.obstacle_first_seen.get(p, -1) < event.end
                                 and self.obstacle_last_seen.get(p, event.end) < event.end):
-                            self.obstacles.discard(p)
-                            self.obstacle_first_seen.pop(p, None)
-                            self.obstacle_last_seen.pop(p, None)
+                            self._forget(p)
         if not frame.own["alive"]:
             return
         current_value = frame.score.get("resource_value", 0)
@@ -76,9 +84,7 @@ class WorldMemory:
             self.enemy_sightings[team] = {"pos": robot["pos"], "tick": frame.tick}
         present_obstacles = {e["pos"] for e in frame.entities if e["type"] == "obstacle"}
         for p in visible - present_obstacles:
-            self.obstacles.discard(p)
-            self.obstacle_first_seen.pop(p, None)
-            self.obstacle_last_seen.pop(p, None)
+            self._forget(p)
         for p in visible:
             self.resources.pop(p, None)
         for entity in frame.entities:
@@ -93,6 +99,11 @@ class WorldMemory:
         if self.spawn is None:
             self.spawn = frame.position
         self.fail_until = {p: until for p, until in self.fail_until.items() if until > frame.tick}
+
+    def _forget(self, p):
+        self.obstacles.discard(p)
+        self.obstacle_first_seen.pop(p, None)
+        self.obstacle_last_seen.pop(p, None)
 
 
 @dataclass
@@ -340,14 +351,11 @@ class Planner:
                     arrival = elapsed + max(1, length)
                     if arrival > remaining or frame.tick + arrival > g["expiry"]:
                         continue
-                    new_counts = counts.copy()
-                    bonus = 0.0
+                    new_counts, bonus, base_reward = counts.copy(), 0.0, g["base"]
                     if g["value"] and c.stage == 2:
                         new_counts[kind(g["value"])] += 1
                         new_counts["planned_value"] += g["value"]
                         bonus = self._mission_bonus(frame, g["value"], new_counts)
-                    base_reward = g["base"]
-                    if g["value"] and c.stage == 2:
                         base_reward = (self.resource_gain(frame, g["value"], counts["planned_value"])
                                        * g["staleness"] * g["race"] * g["survive"](arrival))
                     urgency = g.get("urgency", 1) if depth == 0 else 1.0
@@ -375,10 +383,7 @@ class Planner:
             engagements = []
             for enemy in enemies:
                 target = enemy["pos"]
-                for p in steps:
-                    if (1 <= manhattan(p, target) <= c.attack_range
-                            and (p[0] == target[0] or p[1] == target[1])):
-                        engagements.append((costs[p], enemy["team"], p))
+                engagements += [(costs[p], enemy["team"], p) for p in steps if in_line(p, target, c.attack_range)]
             if engagements:
                 _, team, target = min(engagements)
                 enemy = next(e for e in enemies if e["team"] == team)
@@ -387,8 +392,7 @@ class Planner:
                 # better exchange), on half the ticks so a rival using the same rule cannot mirror us. Only
                 # below the damage cap: past it our damage scores nothing while the enemy's still may.
                 me = frame.position
-                lines_up = any(1 <= manhattan(q, me) <= c.attack_range and (q[0] == me[0] or q[1] == me[1])
-                               and q not in memory.obstacles
+                lines_up = any(in_line(q, me, c.attack_range) and q not in memory.obstacles
                                for q in (add(enemy["pos"], d) for d in DIRECTIONS.values()))
                 if (enemy.get("moved") and lines_up and target != me and frame.own["hp"] >= enemy["hp"]
                         and frame.score.get("effective_damage", 0) < c.damage_cap
