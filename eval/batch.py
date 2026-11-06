@@ -54,7 +54,7 @@ def summarize(rows, compare=None):
             s["dmg"] += t.get("effective_damage", 0)
             s["mis"] += t.get("mission_completed", 0)
             s["inv"] += t.get("invalid_actions", 0)
-            s["win"] += t["rank"] == 1
+            s["win"] += t.get("first", t["rank"] == 1)  # a shared first place counts as a share
             # Lead over the best other team: positive when first, larger is better.
             s["lead"] += t.get("score", 0) - max(o.get("score", 0) for o in r["teams"] if o is not t)
     print(f"{'bot':<14}{'n':>5}{'score':>8}{'res':>7}{'dmg':>8}{'miss':>6}{'inv':>6}{'win':>7}{'lead':>7}")
@@ -115,6 +115,8 @@ def main():
                         help="port/ROS-domain slot of the first worker; give concurrent batches disjoint slots")
     parser.add_argument("--tick-ms", type=int, default=250, help="250: no decision is late (contest: 500)")
     parser.add_argument("--max-ticks", type=int, default=500)
+    parser.add_argument("--full", action="store_true",
+                        help="play all ticks; default ends once the last resource is taken and ranks by resources")
     parser.add_argument("--out", required=True)
     parser.add_argument("--compare", help="a,b: paired comparison of two bots")
     parser.add_argument("--summary", action="store_true", help="only summarize existing results")
@@ -173,7 +175,7 @@ def main():
             result = run_match(config, seats, versions, practice, out / f"m{seed}_r{shift}{suffix}",
                                port=8100 + slot, domain=40 + 2 * slot,
                                tick_ms=args.tick_ms, max_ticks=args.max_ticks,
-                               ai_mode=args.ai_mode, target=target)
+                               ai_mode=args.ai_mode, target=target, full=args.full)
             if result.get("ok"):
                 break
         return dict(result, seed=seed, rotation=shift, attempts=attempt + 1)

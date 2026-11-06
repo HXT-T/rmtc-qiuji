@@ -32,7 +32,7 @@ def load(spec):
             done = {x["last_action"]["tick"]: x["last_action"]["action"] for x in log if x["kind"] == "receipt"}
             decisions = {x["tick"]: x for x in log if x["kind"] == "decision"}
             out[str(r["seed"]), r["rotation"]] = dict(
-                win=me["rank"] == 1, score=me["score"], lead=me["score"] - best["score"],
+                win=me.get("first", me["rank"] == 1), score=me["score"], lead=me["score"] - best["score"],
                 res=me["resource_value"], dmg=me["effective_damage"], mis=me["mission_completed"],
                 drop=sum(d["action"]["action"] != "wait" and done.get(t) == "wait" for t, d in decisions.items()),
                 log=decisions)

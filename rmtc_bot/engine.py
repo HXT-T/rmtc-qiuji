@@ -131,7 +131,7 @@ class Engine:
                     and receipt.get("error") == "E_BLOCKED" and self.last_move_target):
                 # Occupancy/temporary barriers are not permanent obstacles.
                 self.planner.memory.fail_until[self.last_move_target] = frame.tick + 2
-        self.history[frame.tick] = {"position": frame.position, "alive": frame.own["alive"],
+        self.history[frame.tick] = {"position": frame.position, "alive": frame.own["alive"], "hp": frame.own["hp"],
                                     "moved": bool(isinstance(receipt, dict)
                                                   and receipt.get("tick") == frame.tick - 1
                                                   and receipt.get("moved") is True),
@@ -320,7 +320,13 @@ class Engine:
             return risk
         stationary_fire = fire_risk(frame.position)
         options = [(0.0 - survival_loss(hits, stationary_fire), "wait", None, "idle")]
-        if defended < incoming:
+        # Under steady fire (we stood here last tick and still lost HP) a defend only buys the same choice next tick,
+        # 10 HP poorer and with nothing dealt: worse than stepping out now or trading hits. So none, unless a full hit
+        # would kill us now (docs 9.12 F-c).
+        before = self.history.get(frame.tick - 1, {})
+        steady = (before.get("position") == frame.position and frame.own["hp"] < before.get("hp", 0)
+                  and hp > max((d for d, _ in hits), default=0))
+        if defended < incoming and not steady:
             reflect_gain = 0.0
             if reflected and not frame.own.get("protected", False):
                 amount = max(e.params.get("reflection_damage", 20)

@@ -32,7 +32,12 @@ def kill(proc):
                 pass
 
 
-def rank(teams):
+def rank(teams, resources_only=False):
+    if resources_only:
+        # Ended when the last resource was taken: every rival is assumed to cap combat and finish its missions,
+        # so resource value alone decides and equal values share the place (docs 9.13).
+        return {t["team"]: 1 + sum(o.get("resource_value", 0) > t.get("resource_value", 0) for o in teams)
+                for t in teams}
     # Rules §3 order: score, missions, resource value, effective damage, fewer invalid actions.
     order = sorted(teams, key=lambda t: (-t.get("score", 0), -t.get("mission_completed", 0),
                                          -t.get("resource_value", 0), -t.get("effective_damage", 0),
@@ -47,7 +52,10 @@ def read_env(path):
 
 def run_match(config, lineup, versions, practice_root, out_dir, port, domain,
               tick_ms=100, max_ticks=500, timeout_margin=120, stage=2, bot_args=(), ai_mode="mock",
-              target=None):
+              target=None, full=True, serve=None):
+    """`full=False` ends the match once the last resource is taken (docs 9.13). `serve(state)` keeps the referee
+    and bots up across sessions (the referee page can deploy more): it gets the referee state every second and
+    returns True to end, which stops the referee and every bot."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
@@ -107,6 +115,17 @@ def run_match(config, lineup, versions, practice_root, out_dir, port, domain,
         time.sleep(8)  # rclpy start-up, DDS discovery, known-route planning (~2 s)
         api(port, "/api/resume", {})
         deadline = time.monotonic() + max_ticks * tick_ms / 1000 + timeout_margin
+        while serve:
+            try:
+                state = api(port, "/api/state")
+            except OSError:  # busy redeploying
+                state = {}
+            if serve(state):
+                result["ok"] = True
+                return result
+            if procs[0].poll() is not None:
+                raise RuntimeError("referee exited")
+            time.sleep(1)
         while time.monotonic() < deadline:
             state = api(port, "/api/state")
             status = state.get("status", {})
@@ -114,12 +133,17 @@ def run_match(config, lineup, versions, practice_root, out_dir, port, domain,
                 raise RuntimeError("referee fault: " + str(state.get("fault") or status.get("fault")))
             if status.get("finished"):
                 break
+            if not full and status.get("tick", 0) > 0 and not state["board"].get("map_view", {}).get("resources", [0]):
+                result["ended"] = "resources"
+                break
             time.sleep(1)
         else:
             raise RuntimeError("match timed out")
         teams = state["board"]["teams"]
-        ranks = rank(teams)
-        result["teams"] = [dict(t, bot=lineup[t["team"]], rank=ranks[t["team"]]) for t in teams]
+        ranks = rank(teams, resources_only=not full)
+        firsts = sum(r == 1 for r in ranks.values())
+        result["teams"] = [dict(t, bot=lineup[t["team"]], rank=ranks[t["team"]],
+                                first=(ranks[t["team"]] == 1) / firsts) for t in teams]
         result["ticks"] = status.get("tick")
         result["ok"] = True
     except Exception as exc:  # recorded per match; the batch keeps going

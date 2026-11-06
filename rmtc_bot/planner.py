@@ -25,6 +25,14 @@ def between(a, c, b):
     return manhattan(a, c) < manhattan(a, b) and manhattan(a, c) + manhattan(c, b) == manhattan(a, b)
 
 
+# P(a rival that could reach a resource no later than us takes it), by what we know of the rival
+# (visible now / seen before / never seen) and its slack (our arrival - its earliest arrival: < 3, < 8, more).
+# The only numbers estimated from data: maximum likelihood on referee truth, 300 mixed-pool matches (docs 9.7).
+TAKE = ((0.231, 0.326, 0.393), (0.004, 0.007, 0.128), (0.002, 0.024, 0.052))
+# The same, for a rival whose view held the resource where we saw it: it knows the resource (docs 9.12).
+KNOWN = (0.509, 0.575, 0.645)
+
+
 def kind(value):
     """Mission category of a resource by its value."""
     return "high_resources" if value >= 20 else "normal_resources"
@@ -47,6 +55,7 @@ class WorldMemory:
         self.distance_cache = (None, {})  # terrain key -> per-source Dijkstra maps
         self.spawn = None  # own first position: rival spawns are hypothesised from it
         self.ever_seen = {}  # every resource position observed this match -> value
+        self.last_sighting = {}  # rival team -> (position, tick) of its latest sighting, kept all match
 
     def update(self, frame, events=None):
         if events:
@@ -82,6 +91,8 @@ class WorldMemory:
             and not (sighting["pos"] in visible and team not in robots)}
         for team, robot in robots.items():
             self.enemy_sightings[team] = {"pos": robot["pos"], "tick": frame.tick}
+            if team != frame.own.get("team"):
+                self.last_sighting[team] = robot["pos"], frame.tick
         present_obstacles = {e["pos"] for e in frame.entities if e["type"] == "obstacle"}
         for p in visible - present_obstacles:
             self._forget(p)
@@ -121,6 +132,7 @@ class Planner:
         self.memory = WorldMemory()
         self.patrol_goal = None
         self.exact = (None, [])  # stage 1: (remaining resources, their optimal order)
+        self.goal = None  # last tick's sequence target, if the route came from the goal sequence
 
     def resource_gain(self, frame, value, planned_value=0):
         if self.config.stage == 1:
@@ -165,7 +177,9 @@ class Planner:
                     continue
                 if p == start and q in fail_until:
                     continue
-                if avoid_robots and q in occupied:
+                # A robot holds its cell this tick only: it blocks our next step, while further on it is a detour
+                # cost, not a wall (a rival crossing a corridor must not erase the goals behind it; docs 9.12 F-d).
+                if avoid_robots and q in occupied and p == start:
                     continue
                 extra = 0.15 if q not in seen else 0.0
                 if timed:
@@ -207,6 +221,7 @@ class Planner:
 
     def route(self, frame, events, history, enemies):
         c, memory = self.config, self.memory
+        last, self.goal = self.goal, None
         occupied = {e["pos"] for e in enemies}
         costs, steps, parent = self.distances(frame.position, frame, events, occupied, True)
         remaining = max(0, c.horizon - frame.tick)
@@ -234,22 +249,19 @@ class Planner:
                         if slack <= 2:
                             return self._route_to(target, parent, frame, events, history, "evacuate", 5.0)
         goals = []
-        rivals = self._rival_reach(frame, events) if c.stage == 2 else []
+        arrivals = self._arrivals(frame, events, enemies) if c.stage == 2 else []
         for p, resource in memory.resources.items():
             if p not in steps or steps[p] > remaining:
                 continue
             # Stage 1 has no rivals: a seen resource stays until we collect it.
             staleness = 1.0 if c.stage == 1 else max(0.45, 1 - (frame.tick - resource["last_seen"]) * 0.006)
-            # Race estimates use only currently visible competitors, never their private state.
+            # Prioritize narrowly winnable races against visible rivals before safe, uncontested pickups.
             rival = min((manhattan(e["pos"], p) for e in enemies), default=1000)
-            race = 0.45 if rival + 1 < steps[p] else 1.0
-            # Rival distance is only a lower bound using currently visible robots.
-            # Prioritize narrowly winnable races before safe, uncontested pickups.
             urgency = 1.45 if c.stage == 2 and steps[p] <= rival + 1 <= steps[p] + 4 else 1.0
-            goals.append({"pos": p, "base": self.resource_gain(frame, resource["value"]) * staleness * race,
+            goals.append({"pos": p, "base": self.resource_gain(frame, resource["value"]) * staleness,
                           "kind": "resource", "value": resource["value"], "expiry": c.horizon,
-                          "staleness": staleness, "race": race, "urgency": urgency,
-                          "survive": self._survival(frame, p, resource["last_seen"], rivals)})
+                          "staleness": staleness, "urgency": urgency,
+                          "survive": lambda arrival, p=p: self._keep(p, arrival, arrivals)})
         done = set(frame.score.get("mission_completed_ids", []))
         if c.stage == 2:
             for mission in frame.missions:
@@ -357,7 +369,7 @@ class Planner:
                         new_counts["planned_value"] += g["value"]
                         bonus = self._mission_bonus(frame, g["value"], new_counts)
                         base_reward = (self.resource_gain(frame, g["value"], counts["planned_value"])
-                                       * g["staleness"] * g["race"] * g["survive"](arrival))
+                                       * g["staleness"] * g["survive"](arrival))
                     urgency = g.get("urgency", 1) if depth == 0 else 1.0
                     new_reward = reward + (base_reward + bonus) * urgency * (0.91 ** depth)
                     efficiency = new_reward / (arrival + 3.5) ** 0.78
@@ -373,8 +385,16 @@ class Planner:
             beam = expanded[:c.beam_width]
         if best[1] >= 0:
             g = goals[best[1]]
-            return self._route_to(g["pos"], parent, frame, events, history,
-                                  g["kind"], best[0])
+            route = self._route_to(g["pos"], parent, frame, events, history, g["kind"], best[0])
+            # A step back to where we stood last tick undoes that step: strictly worse than going on with either
+            # plan. If last tick's target is still a candidate, keep going there (docs 9.12 F-b).
+            back = history.get(frame.tick - 1, {}).get("position")
+            h = next((h for h in goals if h["pos"] == last), None)
+            if back != frame.position and route.path[1:2] == (back,) and h and h is not g:
+                kept = self._route_to(h["pos"], parent, frame, events, history, h["kind"], best[0])
+                route = kept if kept.direction else route
+            self.goal = route.goal
+            return route
 
         # Once collection/mission opportunities are exhausted, approach visible
         # opponents before exploring empty corners. Only visible enemies influence
@@ -450,11 +470,38 @@ class Planner:
         per_value = 0.25 if c.stage == 2 else self.resource_gain(frame, 1.0)
         return c.explore_weight * unseen * left / cells * per_value * fade
 
-    def _survival(self, frame, p, last_seen, rivals):
-        """Chance a resource seen at p on tick `last_seen` is still there after `arrival`
-        more ticks: the rival sweep model conditioned on it having been present then."""
-        before = max(1e-6, self._clear(p, last_seen, rivals))
-        return lambda arrival: min(1.0, self._clear(p, frame.tick + arrival, rivals) / before)
+    def _arrivals(self, frame, events, enemies):
+        """Per rival: (what we know of it, earliest ticks from now it could stand on a cell), by logic alone.
+        Visible: its path steps. Seen before: steps from its last sighting less the ticks since (it moves at
+        most one cell a tick), or from its spawn if it may have died since. Never seen: steps from the nearest
+        hypothesised spawn less the tick (images of our spawn, 2 cells of slack for their inexactness)."""
+        spawn = self._rival_reach(frame, events)
+        home = lambda p: max(0, min((rv.get(p, 99) for rv in spawn), default=99) - frame.tick - 2)
+        visible = {e["team"]: e["pos"] for e in enemies}
+        sees = lambda q: lambda p: max(abs(p[0] - q[0]), abs(p[1] - q[1])) <= frame.radius
+        out = []
+        for team in sorted(set("ABCD") - {frame.own.get("team")}):
+            if team in visible:
+                d = self.distances(visible[team], frame, events)[1]
+                out.append((0, lambda p, d=d: d.get(p, 99), sees(visible[team])))
+            elif team in self.memory.last_sighting:
+                pos, tick = self.memory.last_sighting[team]
+                d, age = self.distances(pos, frame, events)[1], frame.tick - tick
+                out.append((1, lambda p, d=d, age=age: max(0, min(d.get(p, 99) - age, home(p))), sees(pos)))
+            else:
+                out.append((2, home, lambda p: False))
+        return out
+
+    @staticmethod
+    def _keep(p, arrival, arrivals):
+        """Chance no rival takes the resource at p before we arrive in `arrival` ticks: a rival that cannot
+        get there first never does; one that can, takes it at its measured rate, higher if its view held p."""
+        keep = 1.0
+        for state, earliest, saw in arrivals:
+            slack = arrival - earliest(p)
+            if slack >= 0:
+                keep *= 1 - (KNOWN if saw(p) else TAKE[state])[(slack >= 3) + (slack >= 8)]
+        return keep
 
     def _rival_reach(self, frame, events):
         """Step maps of the hypothesised rivals: at the rotations of our own spawn about the

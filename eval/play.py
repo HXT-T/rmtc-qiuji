@@ -1,5 +1,8 @@
-"""One watched stage-2 match (run inside WSL; the desktop launcher calls this). Pick the map, our
-seat, the opponents and the tick length; the referee's page opens in the Windows browser.
+"""Watched stage-2 matches (run inside WSL; the desktop launcher calls this). Pick the map, our
+seat, the opponents and the tick length; the referee's page opens in the Windows browser. Starting it
+ends the previous deployment first. While it runs, type n (end this deployment and set up a new match) or q
+(end) and Enter. The referee and bots stay up after a match: "部署新练习" on the page starts the next session
+with them, and every finished session prints its result.
 
 Our bot is the working tree of this repository (the current best version). Opponents are the
 q1030 and v8 snapshots in ~/rmtc-eval/versions, other teams' programs in the opponent pool (ff, ls,
@@ -7,7 +10,9 @@ mi; eval/README.md), the best version itself, the official reference robot ('ref
 exploiter ('thief').
 """
 import json
+import os
 import random
+import signal
 import subprocess
 import sys
 import threading
@@ -18,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from batch import MAPS, SEATS  # noqa: E402
 from maps import generate  # noqa: E402
-from match import api, run_match  # noqa: E402
+from match import api, rank, run_match  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 EVAL = Path.home() / "rmtc-eval"
@@ -60,7 +65,48 @@ def open_browser(url):
         time.sleep(0.5)
 
 
-def main():
+def stop_previous():
+    """End the last deployment: an earlier play.py and every referee/bot process it started (they carry its
+    internal ROS domain in their environment), including ones orphaned when its window was closed."""
+    mark = f"RMTC_INTERNAL_DOMAIN_ID={DOMAIN + 1}".encode()
+    victims = []
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit() or int(d.name) in (os.getpid(), os.getppid()):
+            continue
+        try:
+            if b"eval/play.py" in (d / "cmdline").read_bytes() or mark in (d / "environ").read_bytes().split(b"\0"):
+                victims.append(int(d.name))
+        except OSError:
+            continue
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in victims:
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+        for _ in range(20):
+            if not any(Path(f"/proc/{pid}").exists() for pid in victims):
+                break
+            time.sleep(0.25)
+    if victims:
+        print(f"已结束上一次部署（{len(victims)} 个进程）")
+
+
+def report(state):
+    teams = state["board"]["teams"]
+    ranks = rank(teams)
+    print(f"\n场次 {state['session_id']} 结束")
+    print(f"{'名次':<4}{'席位':<4}{'程序':<10}{'得分':>7}{'资源':>6}{'伤害':>7}{'任务':>5}")
+    for t in sorted(teams, key=lambda t: ranks[t["team"]]):
+        print(f"{ranks[t['team']]:<6}{t['team']:<6}{t.get('team_name', ''):<12}{t.get('score', 0):>7.1f}"
+              f"{t.get('resource_value', 0):>7.0f}{t.get('effective_damage', 0):>8.0f}{t.get('mission_completed', 0):>5}")
+    print(HELP, flush=True)
+
+
+HELP = "输入 n 回车 = 结束并部署新比赛；q 回车 = 结束。网页上的「部署新练习」也可以开下一场。"
+
+
+def setup():
     seed = ask("地图", [(f"固定图 {n}", n) for n in range(1, 10)] + [("随机新图", "new"), ("随机图（指定种子）", "seed")])
     if seed == "new":
         seed = f"r{random.randrange(10 ** 6)}"
@@ -79,20 +125,58 @@ def main():
     opponents = iter(pick_opponents(choices))
     lineup = {s: "best" if s == seat else next(opponents) for s in SEATS}
     tick_ms = ask("速度", [("正式 500 ms/Tick（约 4 分钟）", 500), ("快速 100 ms/Tick（约 1 分钟）", 100)])
+    print(f"\n地图 {seed}，席位 " + "  ".join(f"{s}={b}" for s, b in lineup.items()))
+    return config, lineup, versions, tick_ms
+
+
+def play(config, lineup, versions, tick_ms):
+    """One deployment; returns the command that ended it ('n' or 'q')."""
     out = EVAL / "runs" / "play" / datetime.now().strftime("%Y%m%d-%H%M%S")
     url = f"http://127.0.0.1:{PORT}"
-    print(f"\n地图 {seed}，席位 " + "  ".join(f"{s}={b}" for s, b in lineup.items()))
-    print(f"裁判页面 {url}（自动打开）；记录保存在 {out}")
+    print(f"裁判页面 {url}（自动打开）；记录保存在 {out}\n{HELP}")
     threading.Thread(target=open_browser, args=(url,), daemon=True).start()
-    result = run_match(config, lineup, versions, str(EVAL / "practice"), out, port=PORT, domain=DOMAIN,
-                       tick_ms=tick_ms, target="best")
-    if not result.get("ok"):
-        print("\n对局失败：" + result.get("error", "?"))
-        return
-    print(f"\n{'名次':<4}{'席位':<4}{'程序':<10}{'得分':>7}{'资源':>6}{'伤害':>7}{'任务':>5}")
-    for t in sorted(result["teams"], key=lambda t: t["rank"]):
-        print(f"{t['rank']:<6}{t['team']:<6}{t['bot']:<12}{t.get('score', 0):>7.1f}{t.get('resource_value', 0):>7.0f}"
-              f"{t.get('effective_damage', 0):>8.0f}{t.get('mission_completed', 0):>5}")
+    stop, reported, result = threading.Event(), set(), {}
+
+    def watch(state):
+        if state.get("status", {}).get("finished") and state.get("session_id") not in reported:
+            reported.add(state["session_id"])
+            report(state)
+        return stop.is_set()
+
+    def run():
+        result.update(run_match(config, lineup, versions, str(EVAL / "practice"), out, port=PORT, domain=DOMAIN,
+                                tick_ms=tick_ms, target="best", serve=watch))
+        if not stop.is_set():
+            print(f"\n部署中止：{result.get('error', '?')}\n{HELP}", flush=True)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    command = "q"
+    try:
+        while True:
+            command = input().strip().lower()
+            if command in ("n", "q"):
+                break
+            print(HELP)
+    except EOFError:
+        command = "q"
+    finally:
+        # Ending (also by closing the window or Ctrl+C) stops the referee and every bot.
+        stop.set()
+        print("正在结束本次部署…", flush=True)
+        worker.join()
+    return command
+
+
+def main():
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: sys.exit(0))
+    stop_previous()
+    try:
+        while play(*setup()) == "n":
+            print("\n部署新比赛")
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
