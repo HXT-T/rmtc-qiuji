@@ -131,7 +131,12 @@ class EngineTests(unittest.TestCase):
 
     def test_reach_uses_mission_coordinate(self):
         f = frame(missions=[{"id": "r", "type": "reach", "target": 999, "position": [3, 2]}])
-        self.assertEqual(Engine(Config()).step(f)["direction"], "right")
+        self.assertEqual(Engine(Config(explore_weight=0.0)).step(f)["direction"], "right")
+
+    def test_reach_waits_while_a_resource_can_still_be_taken(self):
+        # docs 9.14: the mission keeps its value, the resource does not.
+        f = frame(entities=[resource((2, 4))], missions=[{"id": "r", "type": "reach", "target": 999, "position": [3, 2]}])
+        self.assertEqual(Engine(Config(explore_weight=0.0)).step(f)["direction"], "down")
 
     def test_completed_reach_not_selected(self):
         e = Engine(Config())

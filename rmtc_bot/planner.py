@@ -264,10 +264,6 @@ class Planner:
                           "survive": lambda arrival, p=p: self._keep(p, arrival, arrivals)})
         done = set(frame.score.get("mission_completed_ids", []))
         if c.stage == 2:
-            for mission in frame.missions:
-                p = mission.get("position")
-                if mission["type"] == "reach" and mission["id"] not in done and p in steps:
-                    goals.append({"pos": p, "base": 5.5, "kind": "mission", "value": 0, "expiry": c.horizon})
             for p, reward, expiry, label in events.opportunities(frame, history):
                 if p in steps and frame.tick + steps[p] < expiry:
                     goals.append({"pos": p, "base": reward, "kind": label, "value": 0, "expiry": expiry})
@@ -283,6 +279,17 @@ class Planner:
             for _, gain, p in sorted(frontier, reverse=True)[:2]:
                 goals.append({"pos": p, "base": self.explore_value(frame, gain),
                               "kind": "explore", "value": 0, "expiry": c.horizon})
+        if c.stage == 2:
+            # The reach mission keeps its value until the match ends and no rival can take it, while known and
+            # unseen resources go to rivals: going there now trades a perishable reward for a durable one. So it
+            # waits until nothing perishable is left, or until there is only just time to walk there (docs 9.14).
+            # Passing over the cell on the way still completes it.
+            perishable = any(g["kind"] in ("resource", "explore") for g in goals)
+            for mission in frame.missions:
+                p = mission.get("position")
+                if (mission["type"] == "reach" and mission["id"] not in done and p in steps
+                        and (not perishable or remaining <= 2 * steps[p])):
+                    goals.append({"pos": p, "base": 5.5, "kind": "mission", "value": 0, "expiry": c.horizon})
 
         # Candidate truncation is based on reachable value/distance, not input ordering.
         def initial_reward(g):
